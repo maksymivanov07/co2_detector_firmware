@@ -15,8 +15,9 @@ constexpr uint8_t LED_G = 5;
 constexpr uint8_t LED_B = 6;
 constexpr uint32_t LED_FREQ = 5000;
 constexpr uint8_t LED_RES = 8;
+constexpr uint8_t LED_BLEND_STEP = 6;  // швидкість плавної зміни кольорів
 uint8_t BRIGHT_DAY = 200;
-uint8_t BRIGHT_NIGHT = 1;  // вимкнено у нічному режимі
+uint8_t BRIGHT_NIGHT = 1;  // мінімальна яскравість у нічному режимі (0 — вимкнено)
 uint8_t BRIGHT_CUR = 200;
 uint8_t GAIN_R = 160, GAIN_G = 180, GAIN_B = 255;
 
@@ -27,7 +28,8 @@ int BRIGHT_ADC = 2224;  // під себе
 constexpr float SMOOTH_ALPHA = 0.4f;
 constexpr float TH_LOW = 0.30f;   // < — ніч
 constexpr float TH_HIGH = 0.70f;  // > — день
-constexpr uint32_t MODE_DWELL_MS = 5000;
+constexpr uint32_t MODE_DWELL_MS = 5000;   // мінімальний час між перемиканнями
+constexpr uint32_t LUX_STABLE_MS = 2000;   // скільки часу під порогом/над порогом для підтвердження
 constexpr uint32_t LUX_POLL_MS = 500;
 
 // --- CO2 пороги для кольорів ---
@@ -45,11 +47,20 @@ bool nightMode = false;
 float smoothLux = 0;
 uint32_t lastSwitchMs = 0;
 uint32_t lastLuxMs = 0;
+uint32_t lastLuxSampleMs = 0;
+uint32_t stableNightMs = 0;
+uint32_t stableDayMs = 0;
+uint8_t prevBright = 0;
+uint8_t curR = 0, curG = 0, curB = 0;
+uint8_t targetR = 0, targetG = 0, targetB = 0;
 
 // --- LED утиліти ---
 inline uint8_t scaleWithGain(uint8_t v, uint8_t gain) {
+  if (BRIGHT_CUR == 0 || v == 0) return 0;
   uint16_t x = static_cast<uint16_t>(v) * BRIGHT_CUR / 255;
+  if (x == 0) x = 1;  // не давати занулити канал при мінімальній яскравості
   x = static_cast<uint16_t>(x) * gain / 255;
+  if (x == 0 && gain > 0) x = 1;
   return x > 255 ? 255 : static_cast<uint8_t>(x);
 }
 
@@ -62,26 +73,54 @@ void ledInit() {
   ledcWrite(LED_B, 0);
 }
 
-inline void setRGB(uint8_t r, uint8_t g, uint8_t b) {
+inline void setColorTarget(uint8_t r, uint8_t g, uint8_t b) {
+  targetR = r;
+  targetG = g;
+  targetB = b;
+}
+
+inline void applyLedPwm(uint8_t r, uint8_t g, uint8_t b) {
   ledcWrite(LED_R, scaleWithGain(r, GAIN_R));
   ledcWrite(LED_G, scaleWithGain(g, GAIN_G));
   ledcWrite(LED_B, scaleWithGain(b, GAIN_B));
 }
 
-inline void C_LIGHT_BLUE() { setRGB(0, 60, 255); }
-inline void C_BLUE() { setRGB(0, 0, 255); }
-inline void C_VIOLET() { setRGB(80, 0, 255); }
-inline void C_ORANGE() { setRGB(255, 50, 0); }
-inline void C_RED() { setRGB(255, 0, 0); }
+void stepLedTowardsTarget() {
+  auto stepChannel = [](uint8_t cur, uint8_t tgt) -> uint8_t {
+    if (cur == tgt) return cur;
+    const int diff = static_cast<int>(tgt) - static_cast<int>(cur);
+    const int delta = (abs(diff) < LED_BLEND_STEP) ? diff : (diff > 0 ? LED_BLEND_STEP : -LED_BLEND_STEP);
+    return static_cast<uint8_t>(cur + delta);
+  };
+
+  const uint8_t nextR = stepChannel(curR, targetR);
+  const uint8_t nextG = stepChannel(curG, targetG);
+  const uint8_t nextB = stepChannel(curB, targetB);
+  const bool changed = (nextR != curR) || (nextG != curG) || (nextB != curB);
+  const bool brightnessChanged = (BRIGHT_CUR != prevBright);
+  curR = nextR;
+  curG = nextG;
+  curB = nextB;
+  if (changed || brightnessChanged) {
+    applyLedPwm(curR, curG, curB);
+  }
+  prevBright = BRIGHT_CUR;
+}
+
+inline void C_LIGHT_BLUE() { setColorTarget(0, 60, 255); }
+inline void C_BLUE() { setColorTarget(0, 0, 255); }
+inline void C_GREEN() { setColorTarget(0, 255, 0); }
+inline void C_ORANGE() { setColorTarget(255, 50, 0); }
+inline void C_RED() { setColorTarget(255, 0, 0); }
 
 void updateLedByCO2(uint16_t co2val) {
   if (nightMode && BRIGHT_CUR == 0) {  // 0 — повністю вимкнено
-    setRGB(0, 0, 0);
+    setColorTarget(0, 0, 0);
     return;
   }
   if (co2val < CO2_T1) C_LIGHT_BLUE();
   else if (co2val <= CO2_T2) C_BLUE();
-  else if (co2val <= CO2_T3) C_VIOLET();
+  else if (co2val <= CO2_T3) C_GREEN();
   else if (co2val <= CO2_T4) C_ORANGE();
   else C_RED();
 }
@@ -100,13 +139,27 @@ void applyBrightnessByLight() {
   const bool wantNight = (norm < TH_LOW);
   const bool wantDay = (norm > TH_HIGH);
   const uint32_t now = millis();
+  const uint32_t dt = now - lastLuxSampleMs;
+  lastLuxSampleMs = now;
+
+  // Накопичуємо стабільний час у кожному напрямку, щоб відфільтрувати короткі сплески.
+  if (wantNight) {
+    stableNightMs += dt;
+    stableDayMs = 0;
+  } else if (wantDay) {
+    stableDayMs += dt;
+    stableNightMs = 0;
+  } else {
+    stableNightMs = 0;
+    stableDayMs = 0;
+  }
 
   if (now - lastSwitchMs > MODE_DWELL_MS) {
-    if (!nightMode && wantNight) {
+    if (!nightMode && stableNightMs >= LUX_STABLE_MS) {
       nightMode = true;
       lastSwitchMs = now;
     }
-    if (nightMode && wantDay) {
+    if (nightMode && stableDayMs >= LUX_STABLE_MS) {
       nightMode = false;
       lastSwitchMs = now;
     }
@@ -161,7 +214,10 @@ void setup() {
     delay(20);
   }
 
+  lastLuxSampleMs = millis();
   applyBrightnessByLight();
+  updateLedByCO2(co2);
+  stepLedTowardsTarget();
   drawScreen();
 }
 
@@ -194,5 +250,6 @@ void loop() {
     }
   }
 
+  stepLedTowardsTarget();
   delay(50);
 }
